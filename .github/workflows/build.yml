@@ -1,0 +1,364 @@
+
+name: Build NGINX NTLM
+
+on:
+  workflow_dispatch:
+    inputs:
+      nginx_version:
+        description: "NGINX version (latest or specific version)"
+        required: true
+        default: "latest"
+        type: string
+
+      platform:
+        description: "Target platform"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - linux
+          - windows
+
+      ntlm_ref:
+        description: "NTLM branch, tag or commit SHA"
+        required: true
+        default: "main"
+        type: string
+
+      publish_release:
+        description: "Publish GitHub Release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ========================================
+  # 1. PREPARE BUILD
+  # ========================================
+  prepare:
+    runs-on: ubuntu-24.04
+
+    outputs:
+      nginx_version: ${{ steps.resolve.outputs.nginx_version }}
+      nginx_sha256: ${{ steps.resolve.outputs.nginx_sha256 }}
+      ntlm_commit: ${{ steps.resolve.outputs.ntlm_commit }}
+
+    steps:
+      - name: Resolve versions and checksums
+        id: resolve
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.nginx_version }}
+          NTLM_REF: ${{ inputs.ntlm_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$REQUESTED_VERSION"
+
+          # Detect latest stable version
+          if [[ "$VERSION" == "latest" ]]; then
+            VERSION=$(curl -fsSL https://nginx.org/en/download.html |
+              python3 -c '
+          import re, sys
+          html = sys.stdin.read()
+          match = re.search(
+              r"Stable version.*?nginx-(\d+\.\d+\.\d+)\.tar\.gz",
+              html,
+              re.S | re.I
+          )
+          if not match:
+              sys.exit("Cannot detect stable version")
+          print(match.group(1))
+          ')
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid NGINX version"
+            exit 1
+          fi
+
+          echo "NGINX version: $VERSION"
+
+          # Get official source archive SHA256
+          RELEASE=$(gh api \
+            "repos/nginx/nginx/releases/tags/release-$VERSION")
+
+          DIGEST=$(jq -er \
+            --arg name "nginx-$VERSION.tar.gz" \
+            '.assets[] | select(.name == $name) | .digest' \
+            <<< "$RELEASE")
+
+          SHA256="${DIGEST#sha256:}"
+
+          if [[ ! "$SHA256" =~ ^[a-fA-F0-9]{64}$ ]]; then
+            echo "Invalid or missing SHA256"
+            exit 1
+          fi
+
+          # Resolve NTLM ref to an immutable commit
+          git clone \
+            https://github.com/Securepoint/nginx-ntlm-modulev2.git \
+            ntlm-module
+
+          git -C ntlm-module checkout --detach "$NTLM_REF"
+
+          NTLM_COMMIT=$(git -C ntlm-module rev-parse HEAD)
+
+          echo "nginx_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "nginx_sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "ntlm_commit=$NTLM_COMMIT" >> "$GITHUB_OUTPUT"
+
+          echo "NGINX: $VERSION"
+          echo "SHA256: $SHA256"
+          echo "NTLM commit: $NTLM_COMMIT"
+
+  # ========================================
+  # 2. BUILD UBUNTU
+  # ========================================
+  build-linux:
+    needs: prepare
+
+    if: inputs.platform == 'all' || inputs.platform == 'linux'
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      NGINX_VERSION: ${{ needs.prepare.outputs.nginx_version }}
+      NGINX_SHA256: ${{ needs.prepare.outputs.nginx_sha256 }}
+      NTLM_COMMIT: ${{ needs.prepare.outputs.ntlm_commit }}
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Checkout NTLM module
+        uses: actions/checkout@v4
+        with:
+          repository: Securepoint/nginx-ntlm-modulev2
+          ref: ${{ needs.prepare.outputs.ntlm_commit }}
+          path: ntlm-module
+          persist-credentials: false
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            perl \
+            curl \
+            ca-certificates \
+            git
+
+      - name: Build Linux
+        shell: bash
+        run: bash scripts/build-linux.sh
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nginx-${{ env.NGINX_VERSION }}-linux-x64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  # ========================================
+  # 3. BUILD WINDOWS
+  # ========================================
+  build-windows:
+    needs: prepare
+
+    if: inputs.platform == 'all' || inputs.platform == 'windows'
+
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      NGINX_VERSION: ${{ needs.prepare.outputs.nginx_version }}
+      NGINX_SHA256: ${{ needs.prepare.outputs.nginx_sha256 }}
+      NTLM_COMMIT: ${{ needs.prepare.outputs.ntlm_commit }}
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Checkout NTLM module
+        uses: actions/checkout@v4
+        with:
+          repository: Securepoint/nginx-ntlm-modulev2
+          ref: ${{ needs.prepare.outputs.ntlm_commit }}
+          path: ntlm-module
+          persist-credentials: false
+
+      - name: Setup MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Windows Perl and NASM
+        shell: pwsh
+        run: |
+          choco install strawberryperl nasm -y --no-progress
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Dependency installation failed"
+          }
+
+          "C:\Strawberry\perl\bin" |
+              Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+
+          "C:\Program Files\NASM" |
+              Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+
+          "C:\ProgramData\chocolatey\bin" |
+              Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify build tools
+        shell: pwsh
+        run: |
+          Get-Command cl.exe
+          Get-Command nmake.exe
+          Get-Command perl.exe
+          Get-Command nasm.exe
+
+          perl -e 'die "Native Windows Perl required" unless $^O eq "MSWin32"'
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Invalid Perl environment"
+          }
+
+          nasm -v
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          update: true
+          install: >-
+            git
+            curl
+            tar
+            gzip
+            coreutils
+            sed
+            grep
+            diffutils
+
+      - name: Download Windows sources
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          COMMON="ntlm-module/utils/build_common.sh"
+
+          sed -i \
+            "s/^NGINX_VERSION=.*/NGINX_VERSION=${NGINX_VERSION}/" \
+            "$COMMON"
+
+          sed -i \
+            "s/^NGINX_SHA256=.*/NGINX_SHA256=${NGINX_SHA256}/" \
+            "$COMMON"
+
+          bash ntlm-module/utils/build_win_download.sh
+
+      - name: Configure Windows build
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          bash ntlm-module/utils/build_win_configure.sh
+
+      - name: Compile and package Windows
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nginx-${{ env.NGINX_VERSION }}-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  # ========================================
+  # 4. PUBLISH RELEASE
+  # ========================================
+  publish:
+    needs:
+      - prepare
+      - build-linux
+      - build-windows
+
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        inputs.publish_release &&
+        needs.prepare.result == 'success' &&
+        (needs.build-linux.result == 'success' ||
+         needs.build-linux.result == 'skipped') &&
+        (needs.build-windows.result == 'success' ||
+         needs.build-windows.result == 'skipped') &&
+        (needs.build-linux.result == 'success' ||
+         needs.build-windows.result == 'success')
+      }}
+
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    env:
+      NGINX_VERSION: ${{ needs.prepare.outputs.nginx_version }}
+      NTLM_COMMIT: ${{ needs.prepare.outputs.ntlm_commit }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: nginx-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd release-assets
+
+          ls -lh
+
+          for checksum in *.sha256; do
+            sha256sum -c "$checksum"
+          done
+
+      - name: Publish GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHORT_COMMIT="${NTLM_COMMIT:0:8}"
+
+          TAG="v${NGINX_VERSION}-ntlm.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+
+          gh release create "$TAG" \
+            release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "NGINX ${NGINX_VERSION} + NTLM v2" \
+            --notes "NGINX ${NGINX_VERSION}. NTLM commit: ${NTLM_COMMIT}. Platform: ${{ inputs.platform }}. Build: ${GITHUB_RUN_NUMBER}."
